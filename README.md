@@ -21,6 +21,11 @@ Disco-DJ includes
  *  reading/writing Gadget4 and SWIFT snapshots
 
 
+## Multi-GPU / multi-node PM runs (this fork, branch `multigpu-kit`)
+`src/discodj_dist` on this branch carries a 2LPT correctness fix and memory optimisations (e.g. 3 Gpc/h, 1536³
+particles on a 3072³ mesh on 8 GH200 GPUs). `src/discodj_mgpu` is a small driver for it, and `multigpu/` holds the
+environment setup, Slurm jobs, examples, tests and documentation: see [multigpu/README.md](multigpu/README.md).
+
 ## Requirements:
 All required dependencies will be automatically instealled when installing Disco-DJ as explained below:
  * `jax` and `jaxlib` are required in order to use Disco-DJ (see https://jax.readthedocs.io/en/latest/installation.html#installation).  

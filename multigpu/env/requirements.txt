@@ -1,0 +1,21 @@
+# Tested set (NCSA Delta GH200 / aarch64, python 3.10.19, conda env "pm"; full list: pip_freeze_pm.txt).
+# The jax[cuda12] extra pulls the pip CUDA 12 / cuDNN / NCCL wheels; no system CUDA toolkit is needed by JAX.
+jax[cuda12]==0.6.2
+jaxlib==0.6.2
+jax-cuda12-plugin==0.6.2
+jax-cuda12-pjrt==0.6.2
+nvidia-cufft-cu12==11.4.1.4   # FFT operands >= 2^31 elements return garbage with this cuFFT (handled in code)
+nvidia-nccl-cu12==2.28.7
+jaxdecomp==0.2.8
+diffrax==0.7.0
+equinox==0.13.2
+lineax==0.0.8
+optimistix==0.0.11
+jaxtyping==0.3.3
+einops==0.8.1
+numpy==2.2.6
+scipy==1.15.3
+typing_extensions==4.15.0
+ml_dtypes==0.5.3
+opt_einsum==3.4.0
+matplotlib==3.10.9      # examples/plot_pk.py only
