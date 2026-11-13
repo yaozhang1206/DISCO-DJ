@@ -24,6 +24,7 @@ Design summary
   existing ``mode="drop"`` of ``jax.lax.scatter_add``.
 """
 
+import os
 from functools import partial
 from typing import Tuple
 
@@ -171,11 +172,73 @@ def slice_unpad(x, pad_width, sharding: NamedSharding):
 
 
 # ---------------------------------------------------------------------------
+# FFTs on large local blocks
+# ---------------------------------------------------------------------------
+# XLA's GPU FFT (cuFFT) returns garbage once an FFT operand reaches 2^31 elements
+# (measured on GH200 / jax 0.6.2: slab rfft2/irfft2 round trip error ~1e8 for a
+# 528 x 2112 x 2112 local block, exact below 2^31). fft_in_chunks splits the call
+# along an untransformed axis so each cuFFT call stays below ``max_elems``; the
+# chunk outputs are written in place into one preallocated buffer.
+
+FFT_CHUNK_MAX_ELEMS = int(os.environ.get("DISCO_FFT_CHUNK_MAX_ELEMS", str(2 ** 31 - 1)))
+
+
+def fft_in_chunks(fn, x, *, fft_axes, out_elems_factor: float = 1.0, max_elems: int | None = None):
+    """Apply ``fn(block, axes)`` -- an FFT over ``axes`` -- to ``x`` in chunks along an untransformed axis.
+
+    Below ``max_elems`` (default 2^31 - 1, the measured cuFFT failure threshold) this is just
+    ``fn(x, fft_axes)``. Above it, unrolled static chunks (separated by optimization barriers)
+    are sliced from ``x`` and written into a preallocated output with ``dynamic_update_slice``
+    (DISCO_FFT_CHUNK_STATIC=0: a ``fori_loop`` instead, which costs more memory on GPU); axes
+    are not moved, so no full-size transposed copies are made. ``out_elems_factor`` = output/input
+    element count (e.g. ~2 for irfft2) so the larger of the two stays below ``max_elems``.
+    """
+    max_elems = FFT_CHUNK_MAX_ELEMS if max_elems is None else max_elems
+    fft_axes = tuple(a % x.ndim for a in fft_axes)
+    elems = max(x.size, int(x.size * out_elems_factor))
+    if elems < max_elems:
+        return fn(x, fft_axes)
+    batch = next(a for a in range(x.ndim) if a not in fft_axes)
+    n = x.shape[batch]
+    per = elems / n
+    k = next((d for d in range(1, n + 1) if n % d == 0 and per * (n // d) < max_elems), n)
+    c = n // k
+    chunk_shape = x.shape[:batch] + (c,) + x.shape[batch + 1:]
+    out_chunk = jax.eval_shape(lambda y: fn(y, fft_axes), jax.ShapeDtypeStruct(chunk_shape, x.dtype))
+    out_shape = out_chunk.shape[:batch] + (n,) + out_chunk.shape[batch + 1:]
+
+    if os.environ.get("DISCO_FFT_CHUNK_STATIC", "1").strip().lower() not in {"0", "false", "no", "off"}:
+        # Unrolled static chunks updated in place (no while-loop operand copies).
+        out = jnp.zeros(out_shape, out_chunk.dtype)
+        for i in range(k):
+            blk = lax.slice_in_dim(x, i * c, (i + 1) * c, axis=batch)
+            out = lax.dynamic_update_slice_in_dim(out, fn(blk, fft_axes), i * c, axis=batch)
+            if i + 1 < k:
+                out, x = lax.optimization_barrier((out, x))   # keep one chunk's temporaries live at a time
+        return out
+
+    def body(i, out):
+        blk = lax.dynamic_slice_in_dim(x, i * c, c, axis=batch)
+        return lax.dynamic_update_slice_in_dim(out, fn(blk, fft_axes), i * c, axis=batch)
+
+    return lax.fori_loop(0, k, body, jnp.zeros(out_shape, out_chunk.dtype))
+
+
+def local_block_elems(global_shape, sharding: NamedSharding) -> int:
+    """Number of elements of one device's block of an array with ``global_shape`` and ``sharding``."""
+    px, py = get_local_pdims(sharding)
+    n = 1
+    for i, s_ in enumerate(global_shape):
+        n *= s_ // (px if i == 0 else py if i == 1 else 1)
+    return n
+
+
+# ---------------------------------------------------------------------------
 # Local CIC/TSC/PCS kernels on a padded mesh
 # ---------------------------------------------------------------------------
 
-def _local_scatter_padded(disp_grid, halo: Tuple[int, int], worder: int,
-                          dtype, factor: int = 1):
+def _scatter_into_vectorized(mesh, disp_grid, halo: Tuple[int, int], worder: int,
+                             dtype, factor: int = 1, x_off=0):
     """Local scatter onto a padded PM mesh, no inter-rank communication.
 
     The displacement field is sized to the PARTICLE grid; the painted mesh
@@ -195,24 +258,14 @@ def _local_scatter_padded(disp_grid, halo: Tuple[int, int], worder: int,
     mesh_padded : (Lx_p*factor + 2*Hx, Ly_p*factor + 2*Hy, Lz_p*factor)
                   raw mass count (NOT delta).
     """
-    Lx_p, Ly_p, Lz_p, _ = disp_grid.shape
-    Lx_m = Lx_p * factor
-    Ly_m = Ly_p * factor
-    Lz_m = Lz_p * factor
     Hx, Hy = halo
 
     # Particle position in LOCAL PADDED PM-grid coordinates:
     #   pos = (i*factor + Hx + disp_x, j*factor + Hy + disp_y, k*factor + disp_z)
     # The Lagrangian PM-cell index of particle (i,j,k) within the shard is
     # i*factor (and similarly for j, k); the +Hx/+Hy offset places it in the
-    # padded mesh interior.
-    pmid_x = (jnp.arange(Lx_p, dtype=disp_grid.dtype) * factor) + Hx
-    pmid_y = (jnp.arange(Ly_p, dtype=disp_grid.dtype) * factor) + Hy
-    pmid_z = jnp.arange(Lz_p, dtype=disp_grid.dtype) * factor
-    pos_x = pmid_x[:, None, None] + disp_grid[..., 0]
-    pos_y = pmid_y[None, :, None] + disp_grid[..., 1]
-    pos_z = pmid_z[None, None, :] + disp_grid[..., 2]
-    pos = jnp.stack([pos_x, pos_y, pos_z], axis=-1).reshape(-1, 3)
+    # padded mesh interior. ``x_off`` = first particle row of this chunk.
+    pos = jnp.stack(_local_positions(disp_grid, halo, factor, x_off), axis=-1)
     n_local = pos.shape[0]
 
     kernel_func, _ = kernel_functions[worder]
@@ -234,12 +287,11 @@ def _local_scatter_padded(disp_grid, halo: Tuple[int, int], worder: int,
     # wrapped with mod. When an axis IS sharded (Hx>0 / Hy>0), we rely on
     # the padded mesh + halo_exchange and DROP out-of-bounds deposits
     # (the JaxPM Lagrangian trick).
-    nx = jnp.mod(neighbor[..., 0], Lx_m + 2 * Hx) if Hx == 0 else neighbor[..., 0]
-    ny = jnp.mod(neighbor[..., 1], Ly_m + 2 * Hy) if Hy == 0 else neighbor[..., 1]
-    nz = jnp.mod(neighbor[..., 2], Lz_m)
+    nx = jnp.mod(neighbor[..., 0], mesh.shape[0]) if Hx == 0 else neighbor[..., 0]
+    ny = jnp.mod(neighbor[..., 1], mesh.shape[1]) if Hy == 0 else neighbor[..., 1]
+    nz = jnp.mod(neighbor[..., 2], mesh.shape[2])
     neighbor = jnp.stack([nx, ny, nz], axis=-1)
 
-    mesh = jnp.zeros((Lx_m + 2 * Hx, Ly_m + 2 * Hy, Lz_m), dtype=dtype)
     dnums = lax.ScatterDimensionNumbers(
         update_window_dims=(),
         inserted_window_dims=(0, 1, 2),
@@ -255,8 +307,8 @@ def _local_scatter_padded(disp_grid, halo: Tuple[int, int], worder: int,
     return mesh
 
 
-def _local_gather_padded(mesh_padded, disp_grid, halo: Tuple[int, int],
-                         worder: int, factor: int = 1):
+def _gather_from_vectorized(mesh_padded, disp_grid, halo: Tuple[int, int],
+                            worder: int, factor: int = 1, x_off=0):
     """Local gather from a (already halo-filled) padded PM mesh.
 
     The padded mesh is sized to the PM grid; the output (one value per
@@ -277,17 +329,11 @@ def _local_gather_padded(mesh_padded, disp_grid, halo: Tuple[int, int],
     field_at_particles : (Lx_p, Ly_p, Lz_p)
     """
     Lx_p, Ly_p, Lz_p, _ = disp_grid.shape
-    Lz_m = Lz_p * factor
+    Lz_m = mesh_padded.shape[2]
     Hx, Hy = halo
     dtype = mesh_padded.dtype
 
-    pmid_x = (jnp.arange(Lx_p, dtype=disp_grid.dtype) * factor) + Hx
-    pmid_y = (jnp.arange(Ly_p, dtype=disp_grid.dtype) * factor) + Hy
-    pmid_z = jnp.arange(Lz_p, dtype=disp_grid.dtype) * factor
-    pos_x = pmid_x[:, None, None] + disp_grid[..., 0]
-    pos_y = pmid_y[None, :, None] + disp_grid[..., 1]
-    pos_z = pmid_z[None, None, :] + disp_grid[..., 2]
-    pos = jnp.stack([pos_x, pos_y, pos_z], axis=-1).reshape(-1, 3)
+    pos = jnp.stack(_local_positions(disp_grid, halo, factor, x_off), axis=-1)
 
     kernel_func, _ = kernel_functions[worder]
     stencil_arr, n_ngbs = get_stencil(3, dtype=dtype, worder=worder)
@@ -322,12 +368,180 @@ def _local_gather_padded(mesh_padded, disp_grid, halo: Tuple[int, int],
 
 
 # ---------------------------------------------------------------------------
+# Memory-lean local kernels: loop over the stencil offsets
+# ---------------------------------------------------------------------------
+# The vectorized kernels above materialise (N, n_ngbs, 3) int32 neighbour indices,
+# (N, n_ngbs, 3) float distances and (N, n_ngbs) weights at once -- ~230-260 bytes per
+# particle for CIC, which dominates the PM-step footprint when n_part ~ n_mesh. These
+# versions build per-axis 1-D weights/indices once (N each) and issue one scatter/gather
+# per stencil offset, so peak particle temporaries are a few (N,) / (N, 3) arrays.
+# Same stencil order (x outer, z inner) and same weight product order (wx*wy*wz).
+# Set DISCO_PM_STENCIL_LOOP=0 to fall back to the vectorized kernels.
+
+_STENCIL_BASE = {1: (0,), 2: (0, 1), 3: (-1, 0, 1), 4: (-1, 0, 1, 2)}
+
+
+def _stencil_loop_enabled() -> bool:
+    return os.environ.get("DISCO_PM_STENCIL_LOOP", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _local_positions(disp_grid, halo, factor, x_off=0):
+    """Flattened local padded-mesh positions of a (rows, Ly_p, Lz_p, 3) particle block.
+
+    ``x_off`` is the block's first particle row within the shard (0, or a traced
+    int for particle chunks); the integer offsets are exact in float, so chunked
+    positions are bit-identical to the unchunked ones.
+    """
+    Lx_p, Ly_p, Lz_p, _ = disp_grid.shape
+    Hx, Hy = halo
+    ar_x = jnp.arange(Lx_p, dtype=disp_grid.dtype)
+    if not (isinstance(x_off, int) and x_off == 0):
+        ar_x = ar_x + jnp.asarray(x_off).astype(disp_grid.dtype)
+    pmid_x = (ar_x * factor) + Hx
+    pmid_y = (jnp.arange(Ly_p, dtype=disp_grid.dtype) * factor) + Hy
+    pmid_z = jnp.arange(Lz_p, dtype=disp_grid.dtype) * factor
+    pos_x = (pmid_x[:, None, None] + disp_grid[..., 0]).reshape(-1)
+    pos_y = (pmid_y[None, :, None] + disp_grid[..., 1]).reshape(-1)
+    pos_z = (pmid_z[None, None, :] + disp_grid[..., 2]).reshape(-1)
+    return pos_x, pos_y, pos_z
+
+
+def _stencil_offset_terms(i, pos, base, worder, wraps, dtype):
+    """Cell indices (N, 3) and kernel weight (N,) of flattened stencil offset ``i``.
+
+    ``i`` is the traced ``fori_loop`` index (x outer, z inner -- the order of
+    ``get_stencil``); only this offset's temporaries are live at a time. A plain
+    Python loop is not enough: XLA then hoists all offsets' index arrays.
+    """
+    kernel_func, _ = kernel_functions[worder]
+    offs = jnp.asarray(_STENCIL_BASE[worder], dtype=base[0].dtype)
+    n = len(_STENCIL_BASE[worder])
+    sel = (i // (n * n), (i // n) % n, i % n)
+    idx, w = [], None
+    for ax in range(3):
+        cell = base[ax] + offs[sel[ax]]
+        k = kernel_func(jnp.abs(pos[ax] - cell.astype(pos[ax].dtype)))
+        w = k if w is None else w * k                       # wx * wy * wz, same order as jnp.prod
+        idx.append(jnp.mod(cell, wraps[ax]) if wraps[ax] is not None else cell)
+    return jnp.stack(idx, axis=-1), w.astype(dtype)
+
+
+def _wraps(mesh_shape, halo):
+    # Same wrapping rule as the vectorized kernels: wrap only fully-local axes.
+    Hx, Hy = halo
+    return (mesh_shape[0] if Hx == 0 else None, mesh_shape[1] if Hy == 0 else None, mesh_shape[2])
+
+
+def _scatter_into_loop(mesh, disp_grid, halo: Tuple[int, int], worder: int,
+                       dtype, factor: int = 1, x_off=0):
+    pos = _local_positions(disp_grid, halo, factor, x_off)
+    rnd = jnp.floor if worder % 2 == 0 else jnp.round
+    base = tuple(rnd(p).astype(jnp.int32) for p in pos)
+    wraps = _wraps(mesh.shape, halo)
+    dnums = lax.ScatterDimensionNumbers(
+        update_window_dims=(),
+        inserted_window_dims=(0, 1, 2),
+        scatter_dims_to_operand_dims=(0, 1, 2),
+    )
+
+    def body(i, mesh):
+        idx, w = _stencil_offset_terms(i, pos, base, worder, wraps, dtype)
+        return lax.scatter_add(mesh, idx, w, dnums, mode="drop")
+
+    return lax.fori_loop(0, len(_STENCIL_BASE[worder]) ** 3, body, mesh)
+
+
+def _gather_from_loop(mesh_padded, disp_grid, halo: Tuple[int, int],
+                      worder: int, factor: int = 1, x_off=0):
+    Lx_p, Ly_p, Lz_p, _ = disp_grid.shape
+    dtype = mesh_padded.dtype
+    pos = _local_positions(disp_grid, halo, factor, x_off)
+    rnd = jnp.floor if worder % 2 == 0 else jnp.round
+    base = tuple(rnd(p).astype(jnp.int32) for p in pos)
+    wraps = _wraps(mesh_padded.shape, halo)
+
+    def body(i, acc):
+        idx, w = _stencil_offset_terms(i, pos, base, worder, wraps, dtype)
+        v = mesh_padded.at[idx[:, 0], idx[:, 1], idx[:, 2]].get(mode='fill', fill_value=0.0)
+        return acc + v * w
+
+    out = lax.fori_loop(0, len(_STENCIL_BASE[worder]) ** 3, body, jnp.zeros(pos[0].shape, dtype))
+    return out.reshape(Lx_p, Ly_p, Lz_p)
+
+
+# ---------------------------------------------------------------------------
+# Particle chunking
+# ---------------------------------------------------------------------------
+# The per-particle temporaries of a scatter/gather (positions, base cells, one
+# offset's (N, 3) indices, weights, values) are 4-12 bytes per particle per live
+# array -- tens of GB per GPU at 1536^3 particles on 8 GPUs. The kernels therefore
+# run over blocks of particle rows (axis 0 of the local displacement block) in a
+# fori_loop, so only one block's temporaries are live. Per-particle results are
+# identical (the scatter_add accumulation order already varies run to run on GPU).
+# DISCO_PM_PART_CHUNK = max particles per block (default 2^26; <= 0 disables).
+
+def _particle_chunk_rows(disp_shape) -> int:
+    Lx_p = disp_shape[0]
+    per_row = disp_shape[1] * disp_shape[2]
+    max_p = int(os.environ.get("DISCO_PM_PART_CHUNK", str(2 ** 26)))
+    if max_p <= 0 or Lx_p * per_row <= max_p:
+        return Lx_p
+    return next((Lx_p // k for k in range(1, Lx_p + 1)
+                 if Lx_p % k == 0 and (Lx_p // k) * per_row <= max_p), 1)
+
+
+def _prep_disp(d, disp_div, disp_dtype):
+    """Displacement in PM-grid units; with ``disp_div`` the input is psi, divided here per chunk."""
+    return d if disp_div is None else (d / disp_div).astype(disp_dtype)
+
+
+def _local_scatter_padded(disp_grid, halo: Tuple[int, int], worder: int,
+                          dtype, factor: int = 1, disp_div=None, disp_dtype=None):
+    """Local scatter onto a padded PM mesh (loop or vectorized kernel, in particle chunks)."""
+    into = _scatter_into_loop if _stencil_loop_enabled() else _scatter_into_vectorized
+    Lx_p, Ly_p, Lz_p, _ = disp_grid.shape
+    Hx, Hy = halo
+    mesh = jnp.zeros((Lx_p * factor + 2 * Hx, Ly_p * factor + 2 * Hy, Lz_p * factor), dtype=dtype)
+    rows = _particle_chunk_rows(disp_grid.shape)
+    if rows == Lx_p:
+        return into(mesh, _prep_disp(disp_grid, disp_div, disp_dtype), halo=halo, worder=worder,
+                    dtype=dtype, factor=factor)
+
+    def body(c, m):
+        d = lax.dynamic_slice_in_dim(disp_grid, c * rows, rows, axis=0)
+        return into(m, _prep_disp(d, disp_div, disp_dtype), halo=halo, worder=worder, dtype=dtype,
+                    factor=factor, x_off=c * rows)
+
+    return lax.fori_loop(0, Lx_p // rows, body, mesh)
+
+
+def _local_gather_padded(mesh_padded, disp_grid, halo: Tuple[int, int],
+                         worder: int, factor: int = 1, disp_div=None, disp_dtype=None):
+    """Local gather from a halo-filled padded PM mesh (loop or vectorized kernel, in particle chunks)."""
+    frm = _gather_from_loop if _stencil_loop_enabled() else _gather_from_vectorized
+    Lx_p, Ly_p, Lz_p, _ = disp_grid.shape
+    rows = _particle_chunk_rows(disp_grid.shape)
+    if rows == Lx_p:
+        return frm(mesh_padded, _prep_disp(disp_grid, disp_div, disp_dtype), halo=halo, worder=worder,
+                   factor=factor)
+
+    def body(c, out):
+        d = lax.dynamic_slice_in_dim(disp_grid, c * rows, rows, axis=0)
+        v = frm(mesh_padded, _prep_disp(d, disp_div, disp_dtype), halo=halo, worder=worder,
+                factor=factor, x_off=c * rows)
+        return lax.dynamic_update_slice_in_dim(out, v, c * rows, axis=0)
+
+    return lax.fori_loop(0, Lx_p // rows, body, jnp.zeros((Lx_p, Ly_p, Lz_p), mesh_padded.dtype))
+
+
+# ---------------------------------------------------------------------------
 # Pattern A: distributed CIC/TSC/PCS density assignment (paint)
 # ---------------------------------------------------------------------------
 
 def scatter_dx_distributed(disp_grid, halo_size: int, worder: int,
                            n_part_tot: int, res_pm: int, boxsize: float,
-                           dtype_num: int, sharding: NamedSharding):
+                           dtype_num: int, sharding: NamedSharding,
+                           disp_div=None, disp_dtype=None):
     """Distributed density assignment with ghost-zone halo exchange.
 
     Pipeline (JaxPM Pattern A):
@@ -396,7 +610,8 @@ def scatter_dx_distributed(disp_grid, halo_size: int, worder: int,
              check_rep=False)
     def _scatter_step(d):
         return _local_scatter_padded(d, halo=(Hx, Hy), worder=worder,
-                                     dtype=dtype, factor=factor)
+                                     dtype=dtype, factor=factor,
+                                     disp_div=disp_div, disp_dtype=disp_dtype)
 
     rho_padded = _scatter_step(disp_grid)
 
@@ -422,7 +637,7 @@ def scatter_dx_distributed(disp_grid, halo_size: int, worder: int,
 # ---------------------------------------------------------------------------
 
 def gather_dx_distributed(acc_field, disp_grid, halo_size: int, worder: int,
-                          sharding: NamedSharding):
+                          sharding: NamedSharding, disp_div=None, disp_dtype=None):
     """Distributed force interpolation with halo fill.
 
     Pipeline (JaxPM Pattern B):
@@ -498,7 +713,8 @@ def gather_dx_distributed(acc_field, disp_grid, halo_size: int, worder: int,
              out_specs=field_spec, check_rep=False)
     def _gather_step(m, d):
         return _local_gather_padded(m, d, halo=(Hx, Hy), worder=worder,
-                                    factor=factor)
+                                    factor=factor, disp_div=disp_div,
+                                    disp_dtype=disp_dtype)
 
     return _gather_step(acc_padded, disp_grid)
 

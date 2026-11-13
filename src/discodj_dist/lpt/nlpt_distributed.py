@@ -10,17 +10,19 @@ helpers here treat the three Fourier axes symmetrically and use
 from __future__ import annotations
 
 from functools import partial
+import os
 import time
 from typing import Iterable
 
 import jax
 import jax.numpy as jnp
 from jax import Array, lax
+from jax.experimental.shard_map import shard_map
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 import jaxdecomp
 
-from ..core.distributed_pm import get_local_pdims, gradient_kernel_dist
+from ..core.distributed_pm import fft_in_chunks, get_local_pdims, gradient_kernel_dist, local_block_elems
 from ..core.kernels import inv_laplace_kernel
 from ..core.utils import set_0_to_val
 
@@ -130,15 +132,33 @@ def pad_fourier_full(
     dtype_c,
     fft_sharding: NamedSharding | None = None,
 ) -> Array:
-    """Pad a full-complex ``pfft3d``-layout field to ``ext_res``."""
+    """Pad a full-complex ``pfft3d``-layout field to ``ext_res``.
+
+    Built from slices + ``concatenate`` (zeros replace the dropped Nyquist plane and
+    the new modes), giving the same layout as ``_fourier_blocks``. Do not switch back to
+    an ``.at[].set`` block scatter into a sharded zeros array: on GPU with jax 0.6.2,
+    when that scatter is fused with a preceding ``-deriv * phi`` inside one ``jit``
+    (as in ``compute_2lpt_initial_state_distributed``), XLA miscompiles it on
+    multi-device meshes at large sizes (512 -> 768 on pdims (1, 2) gave a padded field
+    ~47% off and a 2LPT term ~0.77x / corr 0.88 vs the single-GPU code).
+    """
     ff = _with_sharding(ff, fft_sharding)
     if ext_res == orig_res:
         return ff
+    if ext_res < orig_res:
+        raise ValueError(f"ext_res={ext_res} must be >= orig_res={orig_res}.")
+    if orig_res % 2 != 0:
+        raise ValueError("Full-complex distributed nLPT requires an even resolution.")
 
-    src_blocks, dst_blocks = _fourier_blocks(orig_res, ext_res)
-    out = jnp.zeros((ext_res, ext_res, ext_res), dtype=dtype_c)
-    out = _with_sharding(out, fft_sharding)
-    out = _set_blocks(out, ff, dst_blocks, src_blocks)
+    half = orig_res // 2
+    n_zero = ext_res - orig_res + 1
+    out = ff.astype(dtype_c)
+    for ax in range(3):
+        lo = lax.slice_in_dim(out, 0, half, axis=ax)             # k = 0 .. N/2-1
+        hi = lax.slice_in_dim(out, half + 1, orig_res, axis=ax)  # k = -N/2+1 .. -1 (Nyquist dropped)
+        zshape = list(out.shape)
+        zshape[ax] = n_zero
+        out = jnp.concatenate([lo, jnp.zeros(zshape, dtype=dtype_c), hi], axis=ax)
     out = set_0_to_val(3, out, 0.0)
     out = out * (ext_res / orig_res) ** 3
     return _with_sharding(out, fft_sharding)
@@ -493,6 +513,125 @@ def _real_psi_from_fourier(
     return out
 
 
+
+# ---------------------------------------------------------------------------
+# Memory-lean dealiased transforms for the 2LPT initializer
+# ---------------------------------------------------------------------------
+# pad_fourier_full + pifft3d (Hessians) and pfft3d + crop_fourier_full (mu2 -> fL)
+# materialise several full-complex ext_res^3 arrays (ext_res = 3/2 res); the forward one
+# was the 2LPT peak (~7 complex ext^3 arrays per device). The versions below run the
+# same pencil algorithm as jaxdecomp's JAX backend (1-D FFT on the local axis, all_to_all,
+# transpose) but pad / crop each axis right before / after its own 1-D transform, use a
+# real FFT for the z axis, and apply the ext-grid derivative kernel on the local axis.
+# Output layouts match pfft3d: Fourier arrays are (Y, Z, X), real arrays (X, Y, Z).
+# DISCO_LPT_LEAN_FFT=0 restores the pfft3d/pifft3d path.
+
+def _lean_fft_enabled(fft_backend: str) -> bool:
+    flag = os.environ.get("DISCO_LPT_LEAN_FFT", "1").strip().lower() not in {"0", "false", "no", "off"}
+    return flag and fft_backend.lower() == "jax"
+
+
+def _pencil_axis_names(field_sharding: NamedSharding):
+    spec = tuple(field_sharding.spec)
+    return spec[0], spec[1]
+
+
+def _ext_deriv_1d(ext_res: int, boxsize: float, axis: int, order: int, dtype):
+    """1-D ext-grid gradient kernel, identical to gradient_kernel_dist on build_k_vecs_dist(ext)."""
+    k = (2.0 * jnp.pi * jnp.fft.fftfreq(ext_res, d=boxsize / ext_res)).astype(dtype)
+    return jnp.asarray(gradient_kernel_dist([k, k, k], axis=axis, order=order)).reshape(-1)
+
+
+def _pad_line(x: Array, orig_res: int, ext_res: int, axis: int) -> Array:
+    half = orig_res // 2
+    lo = lax.slice_in_dim(x, 0, half, axis=axis)
+    hi = lax.slice_in_dim(x, half + 1, orig_res, axis=axis)   # Nyquist plane dropped
+    zshape = list(x.shape); zshape[axis] = ext_res - orig_res + 1
+    return jnp.concatenate([lo, jnp.zeros(zshape, x.dtype), hi], axis=axis)
+
+
+def _crop_line(x: Array, orig_res: int, ext_res: int, axis: int) -> Array:
+    half = orig_res // 2
+    lo = lax.slice_in_dim(x, 0, half, axis=axis)
+    hi = lax.slice_in_dim(x, ext_res - half + 1, ext_res, axis=axis)
+    zshape = list(x.shape); zshape[axis] = 1                  # Nyquist plane left at zero
+    return jnp.concatenate([lo, jnp.zeros(zshape, x.dtype), hi], axis=axis)
+
+
+def pifft3d_padded_real(
+    fk: Array, *, orig_res: int, ext_res: int, boxsize: float, deriv_axis: int | None,
+    grad_kernel_order: int, dtype, field_sharding: NamedSharding,
+) -> Array:
+    """Real ``pifft3d(deriv_ext[deriv_axis] * pad_fourier_full(fk))`` without full ext^3 complex temporaries.
+
+    ``fk``: (Y, Z, X) full-complex field at ``orig_res`` (Hermitian, as produced from real data).
+    Returns the (X, Y, Z) real field at ``ext_res`` sharded like ``field_sharding``.
+    """
+    ax_x, ax_y = _pencil_axis_names(field_sharding)
+    mesh = field_sharding.mesh
+    N, M, half = orig_res, ext_res, orig_res // 2
+    pencil = NamedSharding(mesh, P(ax_x, ax_y, None))
+    fk = lax.with_sharding_constraint(set_0_to_val(3, fk, 0.0), pencil)
+    rdtype = dtype
+    dk = None if deriv_axis is None else _ext_deriv_1d(M, boxsize, deriv_axis, grad_kernel_order, rdtype)
+    scale = (M / N) ** 3
+
+    def _local(b):                                     # (Y/px, Z/py, X=N)
+        b = _pad_line(b, N, M, axis=2)                 # X -> M
+        if deriv_axis == 0:
+            b = b * dk.astype(b.dtype)[None, None, :]
+        b = fft_in_chunks(lambda c, ax: jnp.fft.ifft(c, axis=ax[0]), b, fft_axes=(2,))
+        b = b.transpose(1, 2, 0)                       # (Z/py, X=M, Y/px)
+        b = lax.all_to_all(b, ax_x, 1, 2, tiled=True)  # (Z/py, X/px, Y=N)
+        b = _pad_line(b, N, M, axis=2)                 # Y -> M
+        if deriv_axis == 1:
+            b = b * dk.astype(b.dtype)[None, None, :]
+        b = fft_in_chunks(lambda c, ax: jnp.fft.ifft(c, axis=ax[0]), b, fft_axes=(2,))
+        b = b.transpose(1, 2, 0)                       # (X/px, Y=M, Z/py)
+        b = lax.all_to_all(b, ax_y, 1, 2, tiled=True)  # (X/px, Y/py, Z=N)
+        hz = jnp.concatenate([b[..., :half], jnp.zeros(b.shape[:2] + (M // 2 + 1 - half,), b.dtype)], axis=2)
+        if deriv_axis == 2:
+            hz = hz * dk[: M // 2 + 1].astype(hz.dtype)[None, None, :]
+        r = fft_in_chunks(lambda c, ax: jnp.fft.irfft(c, n=M, axis=ax[0]), hz, fft_axes=(2,), out_elems_factor=2.0)
+        return (r * scale).astype(rdtype)              # (X/px, Y/py, Z=M)
+
+    out = shard_map(_local, mesh=mesh, in_specs=(P(ax_x, ax_y, None),), out_specs=P(ax_x, ax_y, None),
+                    check_rep=False)(fk)
+    return _with_sharding(out, field_sharding)
+
+
+def pfft3d_real_cropped(
+    real_ext: Array, *, orig_res: int, ext_res: int, dtype_c, field_sharding: NamedSharding,
+    fft_sharding: NamedSharding | None,
+) -> Array:
+    """``crop_fourier_full(pfft3d(real_ext))`` without full ext^3 complex temporaries.
+
+    ``real_ext``: (X, Y, Z) real field at ``ext_res``. Returns (Y, Z, X) full-complex at ``orig_res``.
+    """
+    ax_x, ax_y = _pencil_axis_names(field_sharding)
+    mesh = field_sharding.mesh
+    N, M, half = orig_res, ext_res, orig_res // 2
+    scale = (N / M) ** 3
+
+    def _local(r):                                     # (X/px, Y/py, Z=M) real
+        h = fft_in_chunks(lambda c, ax: jnp.fft.rfft(c, axis=ax[0]), r, fft_axes=(2,))   # (.., .., M/2+1)
+        lo = h[..., :half]
+        hi = jnp.conj(h[..., half - 1:0:-1])           # k = -(half-1) .. -1 from Hermitian symmetry
+        b = jnp.concatenate([lo, jnp.zeros(h.shape[:2] + (1,), h.dtype), hi], axis=2).astype(dtype_c)
+        b = lax.all_to_all(b, ax_y, 2, 1, tiled=True)  # (X/px, Y=M, Z/py)
+        b = b.transpose(2, 0, 1)                       # (Z/py, X/px, Y=M)
+        b = _crop_line(fft_in_chunks(lambda c, ax: jnp.fft.fft(c, axis=ax[0]), b, fft_axes=(2,)), N, M, axis=2)
+        b = lax.all_to_all(b, ax_x, 2, 1, tiled=True)  # (Z/py, X=M, Y/px)
+        b = b.transpose(2, 0, 1)                       # (Y/px, Z/py, X=M)
+        b = _crop_line(fft_in_chunks(lambda c, ax: jnp.fft.fft(c, axis=ax[0]), b, fft_axes=(2,)), N, M, axis=2)
+        return (b * scale).astype(dtype_c)             # (Y/px, Z/py, X=N)
+
+    real_ext = _with_sharding(real_ext, NamedSharding(mesh, P(ax_x, ax_y, None)))
+    out = shard_map(_local, mesh=mesh, in_specs=(P(ax_x, ax_y, None),), out_specs=P(ax_x, ax_y, None),
+                    check_rep=False)(real_ext)
+    return _with_sharding(out, fft_sharding)
+
+
 def compute_2lpt_initial_state_distributed(
     fphi_ini: Array,
     *,
@@ -529,6 +668,10 @@ def compute_2lpt_initial_state_distributed(
     )
     if fft_sharding is None:
         fft_sharding = getattr(fphi_ini, "sharding", None)
+    if local_block_elems((res,) * 3, field_sharding) >= 2 ** 31:
+        raise ValueError(
+            f"Local 2LPT block {local_block_elems((res,) * 3, field_sharding):.3e} elements >= 2^31: "
+            "XLA/cuFFT returns wrong FFT results at this size (measured on GH200); use more GPUs.")
 
     dtype = jnp.float64 if dtype_num == 64 else jnp.float32
     dtype_c = jnp.complex128 if dtype_c_num == 128 else jnp.complex64
@@ -537,6 +680,12 @@ def compute_2lpt_initial_state_distributed(
     if mu2_fft_backend.lower() not in {"jax", "cudecomp"}:
         raise ValueError(f"mu2_fft_backend must be 'JAX' or 'cudecomp', got {mu2_fft_backend!r}.")
     mu2_fft_backend = "cudecomp" if mu2_fft_backend.lower() == "cudecomp" else "JAX"
+    lean_fft = _lean_fft_enabled(fft_backend)
+    lean_mu2_fft = _lean_fft_enabled(mu2_fft_backend)
+    if not (lean_fft and lean_mu2_fft) and local_block_elems((ext_res,) * 3, field_sharding) >= 2 ** 31:
+        raise ValueError(
+            f"Local dealiased 2LPT block {local_block_elems((ext_res,) * 3, field_sharding):.3e} elements >= 2^31: "
+            "XLA/cuFFT returns wrong FFT results at this size; keep DISCO_LPT_LEAN_FFT=1 (chunked FFTs) or use more GPUs.")
 
     def _progress(message: str, arr: Array | None = None) -> None:
         if not progress:
@@ -549,7 +698,7 @@ def compute_2lpt_initial_state_distributed(
     _progress(
         "2LPT setup: "
         f"res={res}, ext_res={ext_res}, dtype={dtype}, dtype_c={dtype_c}, "
-        f"fft_backend={fft_backend}, mu2_fft_backend={mu2_fft_backend}"
+        f"fft_backend={fft_backend}, mu2_fft_backend={mu2_fft_backend}, lean_fft={lean_fft}, lean_mu2_fft={lean_mu2_fft}"
     )
 
     # The input is expected to come from the distributed fphi builder or
@@ -576,6 +725,16 @@ def compute_2lpt_initial_state_distributed(
     D2 = D * D
 
     def hessian_real_ext(component: int, axis: int) -> Array:
+        if lean_fft:
+            @jax.jit
+            def _compute_lean(phi, deriv_component):
+                psi1_component = _with_sharding(-deriv_component * phi, fft_sharding)
+                return pifft3d_padded_real(
+                    psi1_component, orig_res=res, ext_res=ext_res, boxsize=boxsize, deriv_axis=axis,
+                    grad_kernel_order=grad_kernel_order, dtype=dtype, field_sharding=field_sharding)
+
+            return _compute_lean(fphi, derivs[component])
+
         @jax.jit
         def _compute(phi, deriv_component):
             # Matches _deriv_component(psi_1, component, axis):
@@ -648,19 +807,24 @@ def compute_2lpt_initial_state_distributed(
 
     @partial(jax.jit, donate_argnums=(0,))
     def mu2_real_to_fL(mu2_real):
-        mu2_complex = _with_sharding(mu2_real.astype(dtype_c), field_sharding)
+        mu2_complex = None if lean_mu2_fft else _with_sharding(mu2_real.astype(dtype_c), field_sharding)
         # The dealiased forward FFT is the peak-workspace step. cuDecomp's
         # pencil forward plan can require an H100-sized scratch buffer at
         # 2304^3, while JAX's distributed FFT avoids that cuFFT workspace.
-        mu2_k_ext = jaxdecomp.pfft3d(mu2_complex, norm="backward", backend=mu2_fft_backend)
-        mu2_k_ext = _with_sharding(mu2_k_ext, fft_sharding)
-        mu2_k = crop_fourier_full(
-            mu2_k_ext,
-            orig_res=res,
-            ext_res=ext_res,
-            dtype_c=dtype_c,
-            fft_sharding=fft_sharding,
-        )
+        if lean_mu2_fft:
+            mu2_k = pfft3d_real_cropped(
+                mu2_real, orig_res=res, ext_res=ext_res, dtype_c=dtype_c,
+                field_sharding=field_sharding, fft_sharding=fft_sharding)
+        else:
+            mu2_k_ext = jaxdecomp.pfft3d(mu2_complex, norm="backward", backend=mu2_fft_backend)
+            mu2_k_ext = _with_sharding(mu2_k_ext, fft_sharding)
+            mu2_k = crop_fourier_full(
+                mu2_k_ext,
+                orig_res=res,
+                ext_res=ext_res,
+                dtype_c=dtype_c,
+                fft_sharding=fft_sharding,
+            )
         if no_factors:
             fac_sym = jnp.asarray(1.0, dtype=dtype_c)
         else:
